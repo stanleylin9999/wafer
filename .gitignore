@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# separate project, has its own repository
+wetcloth-sim/
+__pycache__/
