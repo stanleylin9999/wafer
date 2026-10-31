@@ -63,7 +63,7 @@ SEQUENCE = [
     ("lift", 6.0, LIFT_Z, FINGER_CLOSED),
 ]
 
-DROP_COUNT = 500
+DROP_COUNT = 900
 DROP_WIDTH = 0.0046              # [m]
 DROP_VOLUME = 5.0e-8             # [m^3] ~0.05 mL, as wetcloth/drops.py
 DROP_EVERY_N_STEPS = 4           # USD write rate of the particles
@@ -75,6 +75,16 @@ TRAPPED_FRACTION = 0.45          # share of the upper-face beads that stay on it
 SHED_SPEED = (0.004, 0.02)       # [m/s] the others creep to the rim at a speed in this range
 UNDER_TAU = 3.0                  # [s] hanging beads feed the drops with this time constant
 PENDING_CELLS = 8                # per side: under-face grid collecting water until a drop forms
+# groove between the frame and the socket: water pools there and the frame shields it from the jet
+GROOVE_BEADS = 170               # extra beads pooled in the groove
+GROOVE_VOLUME = 2.0              # [-] their volume, relative to BEAD_VOLUME
+GROOVE_BLOW = 0.12               # [-] jet removal rate in the groove, relative to an open surface
+# water pouring off the rim as the fixture comes out
+RUNOFF_RATE = 70.0               # [drops/s] just after leaving the water
+RUNOFF_TAU = 1.2                 # [s] rate decays with this time constant
+SPLASH_COUNT = 3                 # small droplets thrown up when a drop lands in the tank
+SPLASH_WIDTH = 0.002             # [m]
+SPLASH_SPEED = 0.7               # [m/s]
 GRAVITY = 9.81
 
 # air gun on the second arm. The first arm's hand sits right above the fixture, so the gun aims
@@ -89,8 +99,13 @@ GUN_DELAY = 2.0                  # [s] natural dripping after the lift, before b
 GUN_APPROACH = 4.0               # [s]
 GUN_PASS = 2.0                   # [s] per row
 GUN_RETREAT = 3.0                # [s]
-JET_RADIUS = 0.025               # [m] footprint on the plate
-JET_RATE = 12.0                  # [1/s] removal rate of beads under the jet
+# Moving-jet ideas from Ternes, arXiv 2510.00085: the removal rate peaks under the jet and falls
+# off around it, and the jet slows down where there is more water, with a smoothed speed.
+JET_RADIUS = 0.025               # [m] removal rate falls to 1/e at this distance
+JET_RATE = 12.0                  # [1/s] removal rate of beads right under the jet
+JET_LOAD_REF = 15.0              # [mean beads] water under the jet that gets the nominal speed
+JET_SPEED_RANGE = (0.4, 2.0)     # [-] sweep speed limits, relative to the nominal speed
+JET_SPEED_TAU = 0.3              # [s] smoothing of the sweep speed
 JET_SPRAY_SPEED = (1.0, 3.0)     # [m/s] blown-off water, along the jet's horizontal direction
 JET_POINTS = 40
 JET_FLOW = 3.0                   # [1/s] speed of the drawn air particles along the jet
@@ -428,6 +443,8 @@ class Drips:
         self.points.SetWidthsInterpolation(UsdGeom.Tokens.vertex)
         self.points.CreateDisplayColorAttr([Gf.Vec3f(0.3, 0.65, 1.0)])
         self.x = np.tile([0.0, 0.0, -10.0], (DROP_COUNT, 1))
+        self.width = np.full(DROP_COUNT, DROP_WIDTH)
+        self.is_splash = np.zeros(DROP_COUNT, dtype=bool)
         self.v = np.zeros((DROP_COUNT, 3))
         self.live = np.zeros(DROP_COUNT, dtype=bool)
         self.landed_tank = 0
@@ -436,14 +453,18 @@ class Drips:
 
     def flush(self):
         self.points.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(self.x.astype(np.float32)))
+        self.points.GetWidthsAttr().Set(Vt.FloatArray.FromNumpy(self.width.astype(np.float32)))
+        self.points.SetWidthsInterpolation(UsdGeom.Tokens.vertex)
 
-    def emit(self, pos, vel=(0.0, 0.0, 0.0)):
+    def emit(self, pos, vel=(0.0, 0.0, 0.0), splash=False):
         free = np.nonzero(~self.live)[0]
         if free.size:
             i = free[0]
             self.x[i] = pos
             self.v[i] = vel
             self.live[i] = True
+            self.is_splash[i] = splash
+            self.width[i] = SPLASH_WIDTH if splash else DROP_WIDTH
 
     def update(self, h):
         self.v[self.live, 2] -= GRAVITY * h
@@ -452,9 +473,16 @@ class Drips:
                   (np.abs(self.x[:, 1] - TANK_CENTER[1]) <= TANK_INNER[1] / 2)
         floor = np.where(in_tank, WATER_Z, 0.0)
         landed = self.live & (self.x[:, 2] <= floor)
-        self.landed_tank += int((landed & in_tank).sum())
+        self.landed_tank += int((landed & in_tank & ~self.is_splash).sum())
+        hits = self.x[landed & in_tank & ~self.is_splash].copy()
         self.live[landed] = False
         self.x[landed] = (0.0, 0.0, -10.0)
+        for pos in hits:
+            for _ in range(SPLASH_COUNT):
+                angle = np.random.uniform(0.0, 2.0 * np.pi)
+                out = 0.3 * SPLASH_SPEED * np.array([np.cos(angle), np.sin(angle)])
+                self.emit((pos[0], pos[1], WATER_Z + 0.001),
+                          (out[0], out[1], np.random.uniform(0.4, 1.0) * SPLASH_SPEED), True)
         self.steps += 1
         if self.steps % DROP_EVERY_N_STEPS == 0:
             self.flush()
@@ -470,20 +498,46 @@ class SurfaceWater:
         self.started = False
         self.pending = np.zeros((PENDING_CELLS, PENDING_CELLS))
         self.steps = 0
+        self.out_time = 0.0
+        self.carry = 0.0
+
+    def in_groove(self):
+        ring = np.maximum(np.abs(self.xy[:, 0]), np.abs(self.xy[:, 1]))
+        return (ring >= SOCKET_SIZE / 2) & (ring < FIXTURE_SIZE[0] / 2 - FRAME_WIDTH)
+
+    def surface_z(self):
+        """Height of the surface under each upper-face bead, from the plate centre."""
+        ring = np.maximum(np.abs(self.xy[:, 0]), np.abs(self.xy[:, 1]))
+        z = np.full(len(ring), FIXTURE_SIZE[2] / 2)        # frame
+        z[ring < FIXTURE_SIZE[0] / 2 - FRAME_WIDTH] = FIXTURE_SIZE[2] / 4     # groove floor
+        z[ring < SOCKET_SIZE / 2] = 0.004                  # socket
+        return z
 
     def start(self):
         W, L, _ = FIXTURE_SIZE
-        n = TOP_BEADS + UNDER_BEADS
+        n = TOP_BEADS + UNDER_BEADS + GROOVE_BEADS
         self.xy = np.random.uniform(-0.5, 0.5, (n, 2)) * (W, L)
         self.vol = BEAD_VOLUME * np.random.uniform(0.4, 1.6, n)
         self.state = np.ones(n, dtype=np.int32)
         self.state[np.random.random(n) < TRAPPED_FRACTION] = 0
         self.state[TOP_BEADS:] = 2
+        first = TOP_BEADS + UNDER_BEADS
+        mid = (SOCKET_SIZE / 2 + W / 2 - FRAME_WIDTH) / 2
+        half = (W / 2 - FRAME_WIDTH - SOCKET_SIZE / 2) * 0.9 / 2
+        side = np.random.randint(0, 4, GROOVE_BEADS)
+        along = np.random.uniform(-mid, mid, GROOVE_BEADS)
+        across = mid + np.random.uniform(-half, half, GROOVE_BEADS)
+        self.xy[first:, 0] = np.where(side < 2, along, across * np.where(side == 2, 1.0, -1.0))
+        self.xy[first:, 1] = np.where(side < 2, across * np.where(side == 0, 1.0, -1.0), along)
+        self.vol[first:] *= GROOVE_VOLUME
+        self.state[first:] = 0
+        self.from_socket = np.maximum(np.abs(self.xy[:, 0]), np.abs(self.xy[:, 1])) < SOCKET_SIZE / 2
         r = np.maximum(np.linalg.norm(self.xy, axis=1, keepdims=True), 1e-6)
         self.vel = self.xy / r * np.random.uniform(*SHED_SPEED, (n, 1))
         self.started = True
         print(f"[tank] water on the fixture: {int((self.state == 0).sum())} beads stay, "
-              f"{int((self.state == 1).sum())} creep, {int((self.state == 2).sum())} hang")
+              f"{int((self.state == 1).sum())} creep, {int((self.state == 2).sum())} hang, "
+              f"{int(((self.state == 0) & self.in_groove()).sum())} in the groove")
 
     def update(self, h, centre, out_of_water):
         if not self.started:
@@ -491,9 +545,13 @@ class SurfaceWater:
                 self.start()
             return
         W, L, T = FIXTURE_SIZE
+        self.runoff(h, centre)
         half = np.array([W / 2, L / 2])
         creeping = self.state == 1
         self.xy[creeping] += self.vel[creeping] * h
+        caught = creeping & self.from_socket & self.in_groove()
+        self.state[caught] = 0                   # socket water stops in the groove
+        creeping = self.state == 1
         over = creeping & (np.abs(self.xy) >= half).any(axis=1)
         self.xy[over] = np.clip(self.xy[over], -half, half)
         self.state[over] = 2                     # round the rim, now hanging under it
@@ -514,25 +572,42 @@ class SurfaceWater:
         if self.steps % DROP_EVERY_N_STEPS == 0:
             self.flush(centre, T)
 
+    def runoff(self, h, centre):
+        """Water still sheeting off the plate: fast drops from random rim points, fading out."""
+        W, L, T = FIXTURE_SIZE
+        self.out_time += h
+        self.carry += RUNOFF_RATE * np.exp(-self.out_time / RUNOFF_TAU) * h
+        while self.carry >= 1.0:
+            self.carry -= 1.0
+            a = np.random.uniform(-0.5, 0.5) * W
+            b = np.random.choice((-0.5, 0.5)) * L
+            x, y = (a, b) if np.random.random() < 0.5 else (b, a)
+            self.drips.emit((centre[0] + x, centre[1] + y, centre[2] - T / 2), (0.0, 0.0, -0.1))
+
     def blow(self, h, centre, hit, direction):
-        """Beads under the jet leave as spray, whatever face they sit on."""
+        """Beads under the jet leave as spray; returns the water load under the jet [mean beads]."""
         if not self.started:
-            return
+            return JET_LOAD_REF
         r = np.linalg.norm(self.xy + np.asarray(centre)[:2] - np.asarray(hit)[:2], axis=1)
-        taken = (self.state != 3) & (r < JET_RADIUS) & (np.random.random(len(r)) < JET_RATE * h)
-        z = centre[2] + FIXTURE_SIZE[2] / 2
+        beta = np.exp(-(r / JET_RADIUS) ** 2)
+        alive = self.state != 3
+        load = float((self.vol[alive] * beta[alive]).sum()) / BEAD_VOLUME
+        rate = JET_RATE * beta * np.where(self.in_groove() & (self.state != 2), GROOVE_BLOW, 1.0)
+        taken = alive & (np.random.random(len(r)) < rate * h)
+        z = centre[2] + self.surface_z()
         flat = np.array([direction[0], direction[1], 0.0])
         flat /= max(np.linalg.norm(flat), 1e-9)
         for i in np.nonzero(taken)[0]:
             vel = flat * np.random.uniform(*JET_SPRAY_SPEED) + (np.random.uniform(-0.6, 0.6) * flat[1],
                                                                 np.random.uniform(-0.6, 0.6),
                                                                 np.random.uniform(0.2, 1.0))
-            self.drips.emit((centre[0] + self.xy[i, 0], centre[1] + self.xy[i, 1], z), vel)
+            self.drips.emit((centre[0] + self.xy[i, 0], centre[1] + self.xy[i, 1], z[i]), vel)
         self.state[taken] = 3
+        return load
 
     def flush(self, centre, T):
         d = np.cbrt(6.0 * self.vol / np.pi)
-        z = np.where(self.state == 2, -T / 2 - d / 2, T / 2 + d / 2)
+        z = np.where(self.state == 2, -T / 2 - d / 2, self.surface_z() + d / 2)
         x = np.stack([centre[0] + self.xy[:, 0], centre[1] + self.xy[:, 1], centre[2] + z], 1)
         gone = self.state == 3
         x[gone] = (0.0, 0.0, -10.0)
@@ -577,6 +652,7 @@ class TankPick:
         self.gun = build_gun_trajectory()
         self.gun_i = 0
         self.gun_t = 0.0
+        self.gun_speed = 1.0
         self.blowing = False
         self.traj = build_trajectory()
         self.picker = Arm(PICKER_PATH)
@@ -643,7 +719,7 @@ class TankPick:
 
     def step_gun(self, h, centre):
         secs, pts, blow, name = self.gun[self.gun_i]
-        self.gun_t += h
+        self.gun_t += h * (self.gun_speed if blow else 1.0)
         a = min(self.gun_t / secs, 1.0) * (len(pts) - 1)
         k = min(int(a), len(pts) - 2)
         q = pts[k] + (pts[k + 1] - pts[k]) * (a - k)
@@ -654,12 +730,15 @@ class TankPick:
             direction = np.array([-R[0, 2], -R[1, 2], R[2, 2]])
             top = centre[2] + FIXTURE_SIZE[2] / 2
             hit = nozzle + direction * (top - nozzle[2]) / direction[2]
-            self.water.blow(h, centre, hit, direction)
+            load = self.water.blow(h, centre, hit, direction)
+            want = np.clip(JET_LOAD_REF / max(load, 1e-6), *JET_SPEED_RANGE)
+            self.gun_speed += (want - self.gun_speed) * min(h / JET_SPEED_TAU, 1.0)
             self.jet.update(h, nozzle, hit)
         elif self.blowing:
             self.jet.hide()
-            left = int((self.water.state != 3).sum())
-            print(f"[tank] blowing done, {left} beads left on the fixture")
+            alive = self.water.state != 3
+            print(f"[tank] blowing done, {int(alive.sum())} beads left on the fixture, "
+                  f"{int((alive & self.water.in_groove()).sum())} in the groove")
         self.blowing = blow
         if self.gun_t >= secs and self.gun_i < len(self.gun) - 1:
             self.gun_i += 1
