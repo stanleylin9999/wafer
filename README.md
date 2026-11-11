@@ -1,6 +1,6 @@
 # CPU 治具水中取出與氣槍吹乾模擬（wafer）
 
-在 Isaac Sim 6.0.1 中建立作業環境：Franka 手臂把 CPU 治具從水缸中夾起，再用氣槍吹走治具上殘留的水。
+在 Isaac Sim 6.0.1 中模擬 CPU 治具的濕式取出流程：機械手臂將治具從水缸中夾出，接著以氣槍吹除表面殘留的水。
 
 ![Isaac Sim 6.0.1](https://img.shields.io/badge/Isaac%20Sim-6.0.1-76B900)
 ![Python](https://img.shields.io/badge/Python-3-3776AB)
