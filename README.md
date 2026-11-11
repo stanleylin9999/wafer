@@ -64,6 +64,8 @@ CPU 治具從水中取出後，表面會留下水珠，水也會沿著邊緣往�
 
 水是自製的視覺粒子，沿用 `wetcloth-sim` 中 `drops.py`「水量累積到一滴才落下」的概念。
 
+外觀上，水缸的水、水珠和水滴都用透明折射材質（OmniGlass，折射率 1.333）；水面是會起漣漪的網格，水滴落下或治具出水時會產生環狀波紋。治具上的水珠是扁的，掛在底面的水珠略微下垂，下落的水滴會稍微拉長。
+
 1. **出水淋水**：治具離水時，邊緣先快速落下約 80 滴水，之後逐漸變少；水滴落回水缸會濺起小水花。
 2. **留在表面**：上表面出現 320 顆水珠，下表面 120 顆，外框與插座之間的凹槽另有 170 顆較大的積水，約 45% 的上表面水珠會一直停留。
 3. **往邊緣移動**：其餘水珠慢慢往外爬，插座上的水會停在凹槽，外框上的水繞到底面。
@@ -127,7 +129,7 @@ CPU 治具從水中取出後，表面會留下水珠，水也會沿著邊緣往�
 
 ## 已知問題
 
-- **水不是流體模擬**：水缸是半透明方塊，水珠不會融合，也沒有表面張力。
+- **水不是流體模擬**：水面漣漪和水珠形狀都是設定出來的，水珠不會融合，也沒有表面張力。
 - **氣流不是流體模擬**：吹水是移除範圍內的水珠，白色氣流只是視覺效果。凹槽難吹是用固定比例設定的，不是由外框遮擋算出來。
 - **抓取是綁定的**：治具被夾住後直接跟著手走，重量不會傳到手臂關節。
 - **治具尺寸受夾爪限制**：Franka 手指最多張開約 8 cm，實際治具若更寬，要改夾取方式或工具。
@@ -158,6 +160,4 @@ wafer/
 ## 參考資料
 
 - [NVIDIA Isaac Sim](https://developer.nvidia.com/isaac/sim)
-- [Consistent control of drying rates of solution thin films by dynamic air-knife drying](https://arxiv.org/pdf/2510.00085)
-- [NVIDIA Isaac Sim: Enabling Scalable, GPU-Accelerated Simulation for Robotics](https://arxiv.org/abs/2606.03551)
-- [Learning Particle Dynamics Subject to Rigid Body Manipulations Using Graph Neural Networks](https://arxiv.org/pdf/2509.03446)
+- S. Ternes, [Consistent control of drying rates of solution thin films by dynamic air-knife drying](https://arxiv.org/pdf/2510.00085)：本專題唯一參考的論文，借用氣流強度分布與依水量變速

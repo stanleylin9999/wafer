@@ -108,6 +108,20 @@ JET_SPEED_RANGE = (0.4, 2.0)     # [-] sweep speed limits, relative to the nomin
 JET_SPEED_TAU = 0.3              # [s] smoothing of the sweep speed
 JET_SPRAY_SPEED = (1.0, 3.0)     # [m/s] blown-off water, along the jet's horizontal direction
 JET_POINTS = 40
+# look of the water: clear refractive material, rippling surface, droplet shapes
+WATER_IOR = 1.333
+WATER_TINT = (0.86, 0.94, 0.97)  # slight blue-green, deepens with depth
+RIPPLE_GRID = 48                 # surface quads per side
+RIPPLE_SPEED = 0.22              # [m/s] ring front speed
+RIPPLE_WAVELENGTH = 0.012        # [m]
+RIPPLE_WIDTH = 0.02              # [m] width of the ring packet
+RIPPLE_DECAY = 1.0               # [s]
+RIPPLE_DROP = 0.0008             # [m] amplitude from one drop
+RIPPLE_SPLASH = 0.0002           # [m] amplitude from a splash droplet
+RIPPLE_FIXTURE = 0.003           # [m] amplitude where the fixture breaks the surface
+RIPPLE_MAX = 60                  # rings kept at once
+BEAD_FLATTEN = 0.55              # height / width of a bead sitting on a surface
+HANG_STRETCH = 0.8               # height / width of a bead hanging under the plate
 JET_FLOW = 3.0                   # [1/s] speed of the drawn air particles along the jet
 # ==========================================================================
 
@@ -116,17 +130,19 @@ import asyncio
 import numpy as np
 import omni.client                                         # ISAAC API
 import omni.kit.app
+import omni.kit.commands
 import omni.physx                                          # ISAAC API
 import omni.timeline
 import omni.usd
 from omni.physx.scripts import physicsUtils                # ISAAC API
-from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics, Vt
+from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade, Vt
 
 TANK_PATH = "/World/WaterTank"
 FIXTURE_PATH = "/World/CpuFixture"
 DROPS_PATH = "/World/TankDrops"
 BEADS_PATH = "/World/TankBeads"
 JET_PATH = "/World/AirJet"
+LOOKS_PATH = "/World/Looks"
 
 # stop a previous run of this script (and of the old towel script, if it shares this namespace)
 for _old in ("TANK_PICK", "WETCLOTH_M2"):
@@ -288,6 +304,38 @@ def make_box(stage, path, center, size, color, opacity, collide):
     return prim
 
 
+def clear_material(stage, name, ior, tint, depth):
+    """Clear refractive material: the OmniGlass MDL when Kit can create it, else a UsdPreviewSurface."""
+    path = f"{LOOKS_PATH}/{name}"
+    try:
+        omni.kit.commands.execute("CreateMdlMaterialPrim", mtl_url="OmniGlass.mdl",      # ISAAC API
+                                  mtl_name="OmniGlass", mtl_path=path)
+        shader_prim = stage.GetPrimAtPath(path + "/Shader")
+        if not shader_prim.IsValid():
+            raise RuntimeError("no shader prim")
+        shader = UsdShade.Shader(shader_prim)
+        shader.CreateInput("glass_color", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*tint))
+        shader.CreateInput("glass_ior", Sdf.ValueTypeNames.Float).Set(float(ior))
+        shader.CreateInput("depth", Sdf.ValueTypeNames.Float).Set(float(depth))
+        shader.CreateInput("frosting_roughness", Sdf.ValueTypeNames.Float).Set(0.0)
+        return UsdShade.Material(stage.GetPrimAtPath(path))
+    except Exception as exc:
+        print(f"[tank] OmniGlass unavailable for {name} ({exc}); using UsdPreviewSurface")
+    material = UsdShade.Material.Define(stage, path + "Preview")
+    shader = UsdShade.Shader.Define(stage, path + "Preview/Shader")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*tint))
+    shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(0.15)
+    shader.CreateInput("ior", Sdf.ValueTypeNames.Float).Set(float(ior))
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.02)
+    material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    return material
+
+
+def bind(prim, material):
+    UsdShade.MaterialBindingAPI.Apply(prim).Bind(material)
+
+
 def build_tank(stage):
     UsdGeom.Xform.Define(stage, TANK_PATH)
     cx, cy = TANK_CENTER
@@ -296,14 +344,17 @@ def build_tank(stage):
     h = TANK_WALL_TOP - TANK_FLOOR_Z
     mz = TANK_FLOOR_Z + h / 2
     glass, op = (0.75, 0.78, 0.82), 0.35
-    make_box(stage, f"{TANK_PATH}/bottom", (cx, cy, TANK_FLOOR_Z / 2),
-             (ix + 2 * w, iy + 2 * w, TANK_FLOOR_Z), glass, op, True)
-    make_box(stage, f"{TANK_PATH}/front", (cx + ix / 2 + w / 2, cy, mz), (w, iy + 2 * w, h), glass, op, True)
-    make_box(stage, f"{TANK_PATH}/back", (cx - ix / 2 - w / 2, cy, mz), (w, iy + 2 * w, h), glass, op, True)
-    make_box(stage, f"{TANK_PATH}/left", (cx, cy + iy / 2 + w / 2, mz), (ix, w, h), glass, op, True)
-    make_box(stage, f"{TANK_PATH}/right", (cx, cy - iy / 2 - w / 2, mz), (ix, w, h), glass, op, True)
-    make_box(stage, f"{TANK_PATH}/water", (cx, cy, (TANK_FLOOR_Z + WATER_Z) / 2),
-             (ix, iy, WATER_Z - TANK_FLOOR_Z), (0.2, 0.5, 0.9), 0.25, False)   # visual only
+    pane = clear_material(stage, "TankGlass", 1.5, (0.95, 0.98, 0.98), 0.01)
+    walls = [
+        make_box(stage, f"{TANK_PATH}/bottom", (cx, cy, TANK_FLOOR_Z / 2),
+                 (ix + 2 * w, iy + 2 * w, TANK_FLOOR_Z), glass, op, True),
+        make_box(stage, f"{TANK_PATH}/front", (cx + ix / 2 + w / 2, cy, mz), (w, iy + 2 * w, h), glass, op, True),
+        make_box(stage, f"{TANK_PATH}/back", (cx - ix / 2 - w / 2, cy, mz), (w, iy + 2 * w, h), glass, op, True),
+        make_box(stage, f"{TANK_PATH}/left", (cx, cy + iy / 2 + w / 2, mz), (ix, w, h), glass, op, True),
+        make_box(stage, f"{TANK_PATH}/right", (cx, cy - iy / 2 - w / 2, mz), (ix, w, h), glass, op, True),
+    ]
+    for prim in walls:
+        bind(prim, pane)
 
 
 def build_fixture(stage):
@@ -434,14 +485,88 @@ class Arm:
                 joint_indices=np.array(self.idx, dtype=np.int32)))
 
 
-class Drips:
-    """Ballistic drops drawn as one Points prim (no physics, so writing it during Play is safe)."""
+class Droplets:
+    """Water droplets as instances of one unit sphere, so each can be squashed or stretched.
+    No physics on them, so writing them during Play is safe."""
 
-    def __init__(self, stage):
-        self.points = UsdGeom.Points.Define(stage, DROPS_PATH)
-        self.points.CreateWidthsAttr(Vt.FloatArray([DROP_WIDTH] * DROP_COUNT))
-        self.points.SetWidthsInterpolation(UsdGeom.Tokens.vertex)
-        self.points.CreateDisplayColorAttr([Gf.Vec3f(0.3, 0.65, 1.0)])
+    def __init__(self, stage, path, count, material):
+        self.inst = UsdGeom.PointInstancer.Define(stage, path)
+        proto = UsdGeom.Sphere.Define(stage, path + "/Prototypes/drop")
+        proto.CreateRadiusAttr(1.0)
+        bind(proto.GetPrim(), material)
+        self.inst.CreatePrototypesRel().SetTargets([proto.GetPath()])
+        self.inst.CreateProtoIndicesAttr(Vt.IntArray([0] * count))
+        self.inst.CreatePositionsAttr()
+        self.inst.CreateScalesAttr()
+        self.set(np.tile([0.0, 0.0, -10.0], (count, 1)), np.zeros((count, 3)))
+
+    def set(self, positions, scales):
+        self.inst.GetPositionsAttr().Set(Vt.Vec3fArray.FromNumpy(positions.astype(np.float32)))
+        self.inst.GetScalesAttr().Set(Vt.Vec3fArray.FromNumpy(scales.astype(np.float32)))
+
+
+class WaterBody:
+    """The tank water as one closed mesh; its top is a grid that carries ring ripples."""
+
+    def __init__(self, stage, material):
+        n = RIPPLE_GRID
+        cx, cy = TANK_CENTER
+        ix, iy = TANK_INNER
+        X, Y = np.meshgrid(np.linspace(cx - ix / 2, cx + ix / 2, n + 1),
+                           np.linspace(cy - iy / 2, cy + iy / 2, n + 1), indexing="xy")
+        self.X, self.Y = X.ravel(), Y.ravel()
+        m = self.X.size
+        top = np.stack([self.X, self.Y, np.full(m, WATER_Z)], 1)
+        bottom = np.stack([self.X, self.Y, np.full(m, TANK_FLOOR_Z)], 1)
+        self.pts = np.concatenate([top, bottom])
+        faces = []
+        for j in range(n):
+            for i in range(n):
+                a = j * (n + 1) + i
+                faces.append((a, a + 1, a + n + 2, a + n + 1))                # top, facing up
+                faces.append((m + a, m + a + n + 1, m + a + n + 2, m + a + 1))  # bottom, facing down
+        ring = [i for i in range(n)] + [i * (n + 1) + n for i in range(n)] + \
+               [n * (n + 1) + n - i for i in range(n)] + [(n - i) * (n + 1) for i in range(n)]
+        for k in range(len(ring)):                                          # walls, facing out
+            p, q = ring[k], ring[(k + 1) % len(ring)]
+            faces.append((p, m + p, m + q, q))
+        self.mesh = UsdGeom.Mesh.Define(stage, f"{TANK_PATH}/water")
+        self.mesh.CreateFaceVertexCountsAttr(Vt.IntArray([4] * len(faces)))
+        self.mesh.CreateFaceVertexIndicesAttr(Vt.IntArray([v for face in faces for v in face]))
+        self.mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
+        self.mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(self.pts.astype(np.float32)))
+        bind(self.mesh.GetPrim(), material)
+        self.rings = []                                                     # [x, y, age, amplitude]
+        self.steps = 0
+
+    def add(self, x, y, amplitude):
+        if abs(x - TANK_CENTER[0]) <= TANK_INNER[0] / 2 and abs(y - TANK_CENTER[1]) <= TANK_INNER[1] / 2:
+            self.rings.append([x, y, 0.0, amplitude])
+            if len(self.rings) > RIPPLE_MAX:
+                self.rings.pop(0)
+
+    def update(self, h):
+        for ring in self.rings:
+            ring[2] += h
+        self.rings = [r for r in self.rings if r[2] < 4.0 * RIPPLE_DECAY]
+        self.steps += 1
+        if self.steps % DROP_EVERY_N_STEPS:
+            return
+        z = np.full(self.X.size, WATER_Z)
+        for x, y, age, amp in self.rings:
+            d = np.hypot(self.X - x, self.Y - y) - RIPPLE_SPEED * age
+            z += amp * np.exp(-age / RIPPLE_DECAY) * np.exp(-(d / RIPPLE_WIDTH) ** 2) \
+                * np.cos(2.0 * np.pi * d / RIPPLE_WAVELENGTH)
+        self.pts[:self.X.size, 2] = z
+        self.mesh.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(self.pts.astype(np.float32)))
+
+
+class Drips:
+    """Ballistic drops; landing in the tank makes a ripple and a few splash droplets."""
+
+    def __init__(self, stage, material, surface):
+        self.view = Droplets(stage, DROPS_PATH, DROP_COUNT, material)
+        self.surface = surface
         self.x = np.tile([0.0, 0.0, -10.0], (DROP_COUNT, 1))
         self.width = np.full(DROP_COUNT, DROP_WIDTH)
         self.is_splash = np.zeros(DROP_COUNT, dtype=bool)
@@ -452,9 +577,10 @@ class Drips:
         self.flush()
 
     def flush(self):
-        self.points.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(self.x.astype(np.float32)))
-        self.points.GetWidthsAttr().Set(Vt.FloatArray.FromNumpy(self.width.astype(np.float32)))
-        self.points.SetWidthsInterpolation(UsdGeom.Tokens.vertex)
+        r = 0.5 * self.width * self.live
+        stretch = 1.0 + np.minimum(0.1 * np.abs(self.v[:, 2]), 0.4)     # falling drops lengthen a little
+        side = r / np.sqrt(stretch)
+        self.view.set(self.x, np.stack([side, side, r * stretch], 1))
 
     def emit(self, pos, vel=(0.0, 0.0, 0.0), splash=False):
         free = np.nonzero(~self.live)[0]
@@ -473,11 +599,14 @@ class Drips:
                   (np.abs(self.x[:, 1] - TANK_CENTER[1]) <= TANK_INNER[1] / 2)
         floor = np.where(in_tank, WATER_Z, 0.0)
         landed = self.live & (self.x[:, 2] <= floor)
+        for pos in self.x[landed & in_tank & self.is_splash]:
+            self.surface.add(pos[0], pos[1], RIPPLE_SPLASH)
         self.landed_tank += int((landed & in_tank & ~self.is_splash).sum())
         hits = self.x[landed & in_tank & ~self.is_splash].copy()
         self.live[landed] = False
         self.x[landed] = (0.0, 0.0, -10.0)
         for pos in hits:
+            self.surface.add(pos[0], pos[1], RIPPLE_DROP)
             for _ in range(SPLASH_COUNT):
                 angle = np.random.uniform(0.0, 2.0 * np.pi)
                 out = 0.3 * SPLASH_SPEED * np.array([np.cos(angle), np.sin(angle)])
@@ -491,10 +620,9 @@ class Drips:
 class SurfaceWater:
     """Beads on the plate, in plate coordinates; state 0 stays, 1 creeps, 2 hangs under, 3 gone."""
 
-    def __init__(self, stage, drips):
+    def __init__(self, stage, drips, material):
         self.drips = drips
-        self.points = UsdGeom.Points.Define(stage, BEADS_PATH)
-        self.points.CreateDisplayColorAttr([Gf.Vec3f(0.55, 0.8, 1.0)])
+        self.view = Droplets(stage, BEADS_PATH, TOP_BEADS + UNDER_BEADS + GROOVE_BEADS, material)
         self.started = False
         self.pending = np.zeros((PENDING_CELLS, PENDING_CELLS))
         self.steps = 0
@@ -606,15 +734,17 @@ class SurfaceWater:
         return load
 
     def flush(self, centre, T):
-        d = np.cbrt(6.0 * self.vol / np.pi)
-        z = np.where(self.state == 2, -T / 2 - d / 2, self.surface_z() + d / 2)
+        """Beads on a surface are flattened caps; beads under the plate hang a little longer."""
+        hanging = self.state == 2
+        r = np.cbrt(3.0 * self.vol / (4.0 * np.pi * BEAD_FLATTEN))          # same volume as the flat cap
+        height = r * np.where(hanging, HANG_STRETCH, BEAD_FLATTEN)
+        z = np.where(hanging, -T / 2 - height, self.surface_z() + 0.5 * height)
         x = np.stack([centre[0] + self.xy[:, 0], centre[1] + self.xy[:, 1], centre[2] + z], 1)
+        scale = np.stack([r, r, height], 1)
         gone = self.state == 3
         x[gone] = (0.0, 0.0, -10.0)
-        d[gone] = 0.0
-        self.points.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(x.astype(np.float32)))
-        self.points.GetWidthsAttr().Set(Vt.FloatArray.FromNumpy(d.astype(np.float32)))
-        self.points.SetWidthsInterpolation(UsdGeom.Tokens.vertex)
+        scale[gone] = 0.0
+        self.view.set(x, scale)
 
 
 class AirJet:
@@ -646,8 +776,11 @@ class AirJet:
 class TankPick:
     def __init__(self, stage):
         self.block = stage.GetPrimAtPath(FIXTURE_PATH)
-        self.drips = Drips(stage)
-        self.water = SurfaceWater(stage, self.drips)
+        water_look = clear_material(stage, "Water", WATER_IOR, WATER_TINT, 0.3)
+        self.body = WaterBody(stage, water_look)
+        self.drips = Drips(stage, water_look, self.body)
+        self.water = SurfaceWater(stage, self.drips, water_look)
+        self.broke_surface = False
         self.jet = AirJet(stage)
         self.gun = build_gun_trajectory()
         self.gun_i = 0
@@ -710,9 +843,15 @@ class TankPick:
             if self.bound is not None:
                 self.follow_block()
             b = self.block.GetAttribute("xformOp:translate").Get()
+            if not self.broke_surface and b[2] + FIXTURE_SIZE[2] / 2 > WATER_Z:
+                self.broke_surface = True                # the plate pushes up through the surface
+                for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1), (0, 0)):
+                    self.body.add(b[0] + dx * FIXTURE_SIZE[0] / 2, b[1] + dy * FIXTURE_SIZE[1] / 2,
+                                  RIPPLE_FIXTURE)
             self.water.update(h, b, b[2] - FIXTURE_SIZE[2] / 2 > WATER_Z)
             self.step_gun(h, b)
             self.drips.update(h)
+            self.body.update(h)
         except Exception as exc:
             self._sub = None
             print(f"[tank] step failed, stopping: {exc}")
