@@ -1,6 +1,6 @@
 # CPU 治具水中取出與氣槍吹乾模擬（wafer）
 
-在 Isaac Sim 6.0.1 中建立雙臂作業環境：一隻 Franka 手臂把 CPU 治具從水缸中夾起，另一隻手臂用氣槍吹走治具上殘留的水。
+在 Isaac Sim 6.0.1 中建立作業環境：Franka 手臂把 CPU 治具從水缸中夾起，再用氣槍吹走治具上殘留的水。
 
 ![Isaac Sim 6.0.1](https://img.shields.io/badge/Isaac%20Sim-6.0.1-76B900)
 ![Python](https://img.shields.io/badge/Python-3-3776AB)
@@ -37,7 +37,7 @@ CPU 治具從水中取出後，表面會留下水珠，水也會沿著邊緣往�
 | 項目 | 狀態 | 說明 |
 |---|---|---|
 | 水缸、水與底座 | ✅ 完成 | 腳本自動建立 |
-| 兩隻 Franka 手臂 | ✅ 完成 | 由 Isaac 素材庫自動載入 |
+| Franka 手臂 | ✅ 完成 | 由 Isaac 素材庫自動載入 |
 | CPU 治具模型 | ✅ 完成 | 外框、螺絲、內凹區、插座與針腳 |
 | 手臂路徑計算 | ✅ 離線驗證 | 自製 IK，路徑可達且未超過關節限位 |
 | 水珠、滴水與吹水粒子 | ✅ 離線驗證 | 粒子邏輯已在 Isaac Sim 外試跑 |
@@ -141,7 +141,7 @@ CPU 治具從水中取出後，表面會留下水珠，水也會沿著邊緣往�
 
 ```text
 wafer/
-├── tank_pick_sim.py      Isaac Sim 腳本：場景、雙臂、水粒子與氣槍
+├── tank_pick_sim.py      Isaac Sim 腳本：場景、手臂、水粒子與氣槍
 ├── docs/
 │   └── 相關論文追蹤.md   相關論文清單
 └── README.md
