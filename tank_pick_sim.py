@@ -107,7 +107,54 @@ JET_LOAD_REF = 15.0              # [mean beads] water under the jet that gets th
 JET_SPEED_RANGE = (0.4, 2.0)     # [-] sweep speed limits, relative to the nominal speed
 JET_SPEED_TAU = 0.3              # [s] smoothing of the sweep speed
 JET_SPRAY_SPEED = (1.0, 3.0)     # [m/s] blown-off water, along the jet's horizontal direction
-JET_POINTS = 40
+JET_POINTS = 900                # gas tracer particles kept at once
+# the air: solved by gas_engine.py (grid solver: advection, turbulent diffusion, pressure
+# projection) on a box around the held fixture. Tracer particles ride the air velocity to show it,
+# and the beads are moved by the air speed just above the plate.
+GAS_ENGINE_DIR = "C:\\Users\\702A\\Desktop\\dive\\wafer"              # folder with gas_engine.py on the Isaac Sim machine; set it if the
+                                 # script is pasted into the Script Editor and the folder is not found
+GAS_SOLVER = "lbm"               # "lbm": lattice Boltzmann (needs Warp/GPU to run in real time)
+                                 # "stable": stable fluids (pressure projection), lighter
+GAS_LBM_MACH = 0.1               # [-] fastest air in lattice units; smaller is more accurate, more sub-steps
+GAS_LBM_SMAGORINSKY = 0.17       # [-] LES turbulence constant; keeps LBM stable at low viscosity
+GAS_DX = 0.0075                  # [m] cell size
+GAS_SHAPE = (40, 32, 32)         # cells; 30 x 24 x 24 cm
+GAS_ORIGIN = (-0.15, -0.12, -0.08)   # [m] first cell, relative to the plate centre while held
+GAS_VISCOSITY = 5e-4             # [m^2/s] effective (turbulent) viscosity: larger spreads and slows the jet
+GAS_PRESSURE_ITERS = 40
+GAS_EVERY_N_STEPS = 4            # air solved at PHYSICS_HZ / this
+GAS_LINGER = 1.5                 # [s] keep solving after the gun stops, while the air settles
+GAS_SPEED = 3.0                  # [m/s] at the nozzle (slowed down from a real jet so it can be seen)
+GAS_NOZZLE_RADIUS = 0.006        # [m]
+GAS_SAMPLE_HEIGHT = 0.006        # [m] air speed for the beads is read this far above the surface
+GAS_REAL_SPEED = 80.0           # [m/s] nozzle speed of the real air gun. The solver runs the slowed
+                                 # GAS_SPEED jet; its field is scaled by GAS_REAL_SPEED / GAS_SPEED
+                                 # for the forces on the water
+GAS_EMIT_RATE = 1500.0           # [tracers/s] while blowing
+GAS_DIFFUSION = 0.08             # [m/sqrt(s)] tracer random walk: turbulence finer than a cell
+GAS_LIFE = 0.8                   # [s] a tracer fades out over this time
+GAS_WIDTH = (0.0015, 0.012)      # [m] tracer size at birth and at the end of its life
+GAS_OPACITY = 0.35               # at birth
+GAS_SHOW_TRACERS = False         # draw the air tracer particles (the air is solved either way)
+# water on the plate as physics: each bead is a sessile drop held by contact-angle hysteresis and
+# pushed by air drag.
+#   pinning  F_pin  = PIN_FACTOR * gamma * w * (cos theta_r - cos theta_a)    (Furmidge)
+#   drag     F_drag = 0.5 * rho_air * Cd * A * u^2       (A: frontal area of the cap, u: air speed)
+#   sliding  F_drag - F_pin = C * mu * r * v,  C = 3 pi ln(r / a) / theta   (de Gennes wedge
+#            dissipation); so a more viscous liquid slides slower under the same push
+#   tear-off as spray when F_drag > TEAR_RATIO * F_pin
+# Each bead gets its own contact angles (surface roughness, contamination), so some stay put,
+# some slide a little and some are blown off. Bigger beads catch more air than they are pinned.
+WATER_VISCOSITY = 1.0e-3         # [Pa s] dynamic viscosity mu (water at 20 C)
+WATER_SURFACE_TENSION = 0.072    # [N/m] gamma
+AIR_DENSITY = 1.2                # [kg/m^3]
+BEAD_DRAG_CD = 1.0               # [-] drag coefficient of a drop sitting on a wall
+CONTACT_ANGLE_ADV = 70.0         # [deg] advancing contact angle on the fixture (mean)
+CONTACT_ANGLE_REC = 40.0         # [deg] receding contact angle (mean)
+CONTACT_ANGLE_SIGMA = 8.0        # [deg] bead-to-bead spread of both angles
+PIN_FACTOR = 1.0                 # [-] shape factor of the pinning force (0.6-1.3 in the literature)
+SLIP_LOG = 14.0                  # [-] ln(r / a), a: molecular cut-off length of the contact line
+TEAR_RATIO = 3.0                 # [-] drag / pinning above which a bead can be torn off as spray
 # look of the water: clear refractive material, rippling surface, droplet shapes
 WATER_IOR = 1.333
 WATER_TINT = (0.86, 0.94, 0.97)  # slight blue-green, deepens with depth
@@ -122,10 +169,12 @@ RIPPLE_FIXTURE = 0.003           # [m] amplitude where the fixture breaks the su
 RIPPLE_MAX = 60                  # rings kept at once
 BEAD_FLATTEN = 0.55              # height / width of a bead sitting on a surface
 HANG_STRETCH = 0.8               # height / width of a bead hanging under the plate
-JET_FLOW = 3.0                   # [1/s] speed of the drawn air particles along the jet
 # ==========================================================================
 
 import asyncio
+import importlib
+import os
+import sys
 
 import numpy as np
 import omni.client                                         # ISAAC API
@@ -136,6 +185,25 @@ import omni.timeline
 import omni.usd
 from omni.physx.scripts import physicsUtils                # ISAAC API
 from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdLux, UsdPhysics, UsdShade, Vt
+
+def _find_gas_engine():
+    """gas_engine.py: next to this file, in GAS_ENGINE_DIR, in the working folder, or ~/Desktop/wafer."""
+    tried = []
+    if "__file__" in globals():
+        tried.append(os.path.dirname(os.path.abspath(__file__)))
+    tried += [GAS_ENGINE_DIR, os.getcwd(), os.path.join(os.path.expanduser("~"), "Desktop", "wafer")]
+    for d in tried:
+        if d and os.path.isfile(os.path.join(d, "gas_engine.py")):
+            return d
+    raise RuntimeError(f"gas_engine.py not found (tried {[d for d in tried if d]}): copy it to the "
+                       "Isaac Sim machine and set GAS_ENGINE_DIR at the top of this script")
+
+
+_GAS_DIR = _find_gas_engine()
+if _GAS_DIR not in sys.path:
+    sys.path.insert(0, _GAS_DIR)
+import gas_engine                                          # noqa: E402  (gas_engine.py next to this script)
+importlib.reload(gas_engine)                               # pick up edits when the script is run again
 
 TANK_PATH = "/World/WaterTank"
 FIXTURE_PATH = "/World/CpuFixture"
@@ -659,6 +727,11 @@ class SurfaceWater:
         self.xy[first:, 1] = np.where(side < 2, across * np.where(side == 0, 1.0, -1.0), along)
         self.vol[first:] *= GROOVE_VOLUME
         self.state[first:] = 0
+        # contact angles per bead; the receding angle stays at least 2 deg below the advancing one
+        adv = CONTACT_ANGLE_ADV + np.random.normal(0.0, CONTACT_ANGLE_SIGMA, n)
+        rec = CONTACT_ANGLE_REC + np.random.normal(0.0, CONTACT_ANGLE_SIGMA, n)
+        self.theta_a = np.radians(np.clip(adv, 5.0, 175.0))
+        self.theta_r = np.radians(np.clip(rec, 1.0, np.degrees(self.theta_a) - 2.0))
         self.from_socket = np.maximum(np.abs(self.xy[:, 0]), np.abs(self.xy[:, 1])) < SOCKET_SIZE / 2
         r = np.maximum(np.linalg.norm(self.xy, axis=1, keepdims=True), 1e-6)
         self.vel = self.xy / r * np.random.uniform(*SHED_SPEED, (n, 1))
@@ -666,6 +739,10 @@ class SurfaceWater:
         print(f"[tank] water on the fixture: {int((self.state == 0).sum())} beads stay, "
               f"{int((self.state == 1).sum())} creep, {int((self.state == 2).sum())} hang, "
               f"{int(((self.state == 0) & self.in_groove()).sum())} in the groove")
+        drag1, pin, _ = self.forces(np.ones(n))                          # drag at 1 m/s
+        u_slide = np.sqrt(pin / drag1)
+        print(f"[tank] air speed to start a bead sliding: {np.percentile(u_slide, 10):.1f} / "
+              f"{np.median(u_slide):.1f} / {np.percentile(u_slide, 90):.1f} m/s (10% / median / 90%)")
 
     def update(self, h, centre, out_of_water):
         if not self.started:
@@ -712,26 +789,60 @@ class SurfaceWater:
             x, y = (a, b) if np.random.random() < 0.5 else (b, a)
             self.drips.emit((centre[0] + x, centre[1] + y, centre[2] - T / 2), (0.0, 0.0, -0.1))
 
-    def blow(self, h, centre, hit, direction):
-        """Beads under the jet leave as spray; returns the water load under the jet [mean beads]."""
+    def air_points(self, centre):
+        """World points just above each upper-face bead, where the air speed is read."""
+        z = centre[2] + self.surface_z() + GAS_SAMPLE_HEIGHT
+        return np.column_stack([centre[0] + self.xy[:, 0], centre[1] + self.xy[:, 1], z])
+
+    def jet_load(self, centre, hit):
+        """Water near the jet's aim point [mean beads], for the sweep speed control."""
         if not self.started:
             return JET_LOAD_REF
         r = np.linalg.norm(self.xy + np.asarray(centre)[:2] - np.asarray(hit)[:2], axis=1)
         beta = np.exp(-(r / JET_RADIUS) ** 2)
         alive = self.state != 3
-        load = float((self.vol[alive] * beta[alive]).sum()) / BEAD_VOLUME
-        rate = JET_RATE * beta * np.where(self.in_groove() & (self.state != 2), GROOVE_BLOW, 1.0)
-        taken = alive & (np.random.random(len(r)) < rate * h)
+        return float((self.vol[alive] * beta[alive]).sum()) / BEAD_VOLUME
+
+    def forces(self, u):
+        """Drag and pinning force [N] and slide resistance [N s/m] of each bead at air speed u [m/s]."""
+        r = np.cbrt(3.0 * self.vol / (4.0 * np.pi * BEAD_FLATTEN))      # contact radius, as drawn
+        height = r * BEAD_FLATTEN
+        area = 0.25 * np.pi * (2.0 * r) * height                         # frontal area of the cap
+        drag = 0.5 * AIR_DENSITY * BEAD_DRAG_CD * area * u * u
+        pin = PIN_FACTOR * WATER_SURFACE_TENSION * 2.0 * r * (np.cos(self.theta_r) - np.cos(self.theta_a))
+        theta = 0.5 * (self.theta_a + self.theta_r)
+        resist = 3.0 * np.pi * SLIP_LOG / theta * WATER_VISCOSITY * r
+        return drag, pin, resist
+
+    def blow(self, h, centre, wind):
+        """Air from the gas solver on the upper-face beads. wind: (n, 2) real air velocity [m/s]
+        along the plate just above each bead. A bead moves only when drag beats contact-angle
+        pinning, then slides at the speed where the excess force equals viscous dissipation;
+        far above pinning it is torn off as spray. Pushed over the rim, it leaves too."""
+        if not self.started or wind is None:
+            return
+        alive = self.state != 3
+        top = alive & (self.state != 2)                  # the air only reaches the upper face
+        u = np.linalg.norm(wind, axis=1)
+        flow = wind / np.maximum(u, 1e-9)[:, None]       # local air direction along the plate
+        u = u * np.sqrt(np.where(self.in_groove(), GROOVE_BLOW, 1.0))   # the frame shields the groove
+        drag, pin, resist = self.forces(u)
+        speed = np.maximum(drag - pin, 0.0) / resist * top
+        self.xy += flow * (speed * h)[:, None]
+        half = 0.5 * np.array(FIXTURE_SIZE[:2])
+        off_edge = top & (np.abs(self.xy) >= half).any(axis=1)
+        self.xy[off_edge] = np.clip(self.xy[off_edge], -half, half)
+        # torn off as spray: rate grows with how far drag is above the tear-off level
+        tear = JET_RATE * np.maximum(drag / np.maximum(pin, 1e-12) - TEAR_RATIO, 0.0)
+        taken = top & ((np.random.random(len(u)) < tear * h) | off_edge)
         z = centre[2] + self.surface_z()
-        flat = np.array([direction[0], direction[1], 0.0])
-        flat /= max(np.linalg.norm(flat), 1e-9)
         for i in np.nonzero(taken)[0]:
-            vel = flat * np.random.uniform(*JET_SPRAY_SPEED) + (np.random.uniform(-0.6, 0.6) * flat[1],
-                                                                np.random.uniform(-0.6, 0.6),
-                                                                np.random.uniform(0.2, 1.0))
+            f = np.array([flow[i, 0], flow[i, 1], 0.0])
+            vel = f * np.random.uniform(*JET_SPRAY_SPEED) + (np.random.uniform(-0.6, 0.6) * f[1],
+                                                             np.random.uniform(-0.6, 0.6) * f[0],
+                                                             np.random.uniform(0.2, 1.0))
             self.drips.emit((centre[0] + self.xy[i, 0], centre[1] + self.xy[i, 1], z[i]), vel)
         self.state[taken] = 3
-        return load
 
     def flush(self, centre, T):
         """Beads on a surface are flattened caps; beads under the plate hang a little longer."""
@@ -748,29 +859,68 @@ class SurfaceWater:
 
 
 class AirJet:
-    """White particles from the nozzle to the plate, drawn only while blowing."""
+    """Tracer particles that show the air: they ride the gas solver's velocity (no gravity, no
+    inertia of their own), random-walk a little for turbulence finer than a cell, grow and fade."""
 
     def __init__(self, stage):
         self.points = UsdGeom.Points.Define(stage, JET_PATH)
-        self.points.CreateWidthsAttr(Vt.FloatArray([0.002] * JET_POINTS))
         self.points.SetWidthsInterpolation(UsdGeom.Tokens.vertex)
-        self.points.CreateDisplayColorAttr([Gf.Vec3f(0.95, 0.97, 1.0)])
-        self.u = np.random.random(JET_POINTS)
-        self.off = np.random.normal(0.0, 1.0, (JET_POINTS, 3))
-        self.steps = 0
-        self.hide()
+        self.points.CreateDisplayColorAttr([Gf.Vec3f(0.92, 0.95, 1.0)])
+        self.opacity = self.points.CreateDisplayOpacityPrimvar(UsdGeom.Tokens.vertex)
+        self.x = np.tile([0.0, 0.0, -10.0], (JET_POINTS, 1))
+        self.age = np.zeros(JET_POINTS)
+        self.live = np.zeros(JET_POINTS, dtype=bool)
+        self.carry = 0.0
+        self.flush()
+        if not GAS_SHOW_TRACERS:
+            UsdGeom.Imageable(self.points.GetPrim()).MakeInvisible()
 
-    def hide(self):
-        self.points.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(
-            np.tile([0.0, 0.0, -10.0], (JET_POINTS, 1)).astype(np.float32)))
+    def emit(self, n, nozzle, direction):
+        """New tracers spread over the nozzle opening."""
+        free = np.nonzero(~self.live)[0][:n]
+        if not free.size:
+            return
+        d = np.asarray(direction, dtype=np.float64)
+        d /= max(np.linalg.norm(d), 1e-9)
+        a = np.cross(d, (0.0, 0.0, 1.0) if abs(d[2]) < 0.9 else (1.0, 0.0, 0.0))
+        a /= np.linalg.norm(a)
+        b = np.cross(d, a)
+        rad = GAS_NOZZLE_RADIUS * np.sqrt(np.random.random(free.size))
+        phi = np.random.uniform(0.0, 2.0 * np.pi, free.size)
+        self.x[free] = np.asarray(nozzle) + rad[:, None] * (np.cos(phi)[:, None] * a + np.sin(phi)[:, None] * b)
+        self.age[free] = 0.0
+        self.live[free] = True
 
-    def update(self, h, nozzle, hit):
-        self.u = (self.u + JET_FLOW * h) % 1.0
-        self.steps += 1
-        if self.steps % DROP_EVERY_N_STEPS == 0:
-            x = np.asarray(nozzle) + (np.asarray(hit) - np.asarray(nozzle)) * self.u[:, None] \
-                + self.off * (0.3 * JET_RADIUS * self.u[:, None])
-            self.points.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(x.astype(np.float32)))
+    def update(self, h, grid, centre, nozzle=None, direction=None):
+        """Called at the gas solver's rate. nozzle/direction given: the gun is blowing."""
+        if nozzle is not None:
+            self.carry += GAS_EMIT_RATE * h
+            n = int(self.carry)
+            self.carry -= n
+            self.emit(n, nozzle, direction)
+        live = np.nonzero(self.live)[0]
+        if live.size:
+            v = grid.sample(self.x[live])
+            self.x[live] += v * h + GAS_DIFFUSION * np.sqrt(h) * np.random.normal(0.0, 1.0, (live.size, 3))
+            self.age[live] += h
+            # tracers that diffused into the plate are put back on its upper face
+            W, L, T = FIXTURE_SIZE
+            rel = self.x - np.asarray(centre)
+            inside = self.live & (np.abs(rel[:, 0]) <= W / 2) & (np.abs(rel[:, 1]) <= L / 2) \
+                & (np.abs(rel[:, 2]) <= T / 2)
+            self.x[inside, 2] = centre[2] + T / 2 + 0.001
+            dead = self.live & ((self.age >= GAS_LIFE) | ~grid.inside(self.x))
+            self.live[dead] = False
+            self.x[dead] = (0.0, 0.0, -10.0)
+        self.flush()
+
+    def flush(self):
+        s = np.clip(self.age / GAS_LIFE, 0.0, 1.0)
+        width = (GAS_WIDTH[0] + (GAS_WIDTH[1] - GAS_WIDTH[0]) * np.sqrt(s)) * self.live
+        alpha = GAS_OPACITY * (1.0 - s) ** 2 * self.live
+        self.points.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(self.x.astype(np.float32)))
+        self.points.GetWidthsAttr().Set(Vt.FloatArray.FromNumpy(width.astype(np.float32)))
+        self.opacity.Set(Vt.FloatArray.FromNumpy(alpha.astype(np.float32)))
 
 
 class TankPick:
@@ -782,6 +932,21 @@ class TankPick:
         self.water = SurfaceWater(stage, self.drips, water_look)
         self.broke_surface = False
         self.jet = AirJet(stage)
+        held = np.array([TANK_CENTER[0], TANK_CENTER[1], GUN_PLATE_Z])
+        if GAS_SOLVER == "lbm":
+            self.air = gas_engine.LBMGrid(held + GAS_ORIGIN, GAS_SHAPE, GAS_DX, viscosity=GAS_VISCOSITY,
+                                          max_speed=GAS_SPEED, mach=GAS_LBM_MACH,
+                                          smagorinsky=GAS_LBM_SMAGORINSKY)
+        else:
+            self.air = gas_engine.GasGrid(held + GAS_ORIGIN, GAS_SHAPE, GAS_DX, viscosity=GAS_VISCOSITY,
+                                          pressure_iters=GAS_PRESSURE_ITERS)
+        print(f"[tank] gas solver: {self.air.backend}, {GAS_SHAPE} cells of {GAS_DX * 1000:.1f} mm")
+        if "numpy" in self.air.backend:
+            print("[tank] WARNING: Warp not available, the gas solver runs on the CPU and will be very slow")
+        self.air_solid_at = None         # fixture centre the solid cells were last built for
+        self.air_idle = GAS_LINGER       # [s] since the gun stopped; the solver sleeps past GAS_LINGER
+        self.air_steps = 0
+        self.wind = None                 # (n, 2) air velocity along the plate over each bead
         self.gun = build_gun_trajectory()
         self.gun_i = 0
         self.gun_t = 0.0
@@ -863,18 +1028,21 @@ class TankPick:
         k = min(int(a), len(pts) - 2)
         q = pts[k] + (pts[k + 1] - pts[k]) * (a - k)
         self.helper.send(q, 0.0)
+        nozzle = direction = None
         if blow:
             p, R, _, _ = franka_fk(q, 0.107 + GUN_TIP)
             nozzle = np.array([HELPER_BASE[0] - p[0], HELPER_BASE[1] - p[1], p[2]])
             direction = np.array([-R[0, 2], -R[1, 2], R[2, 2]])
             top = centre[2] + FIXTURE_SIZE[2] / 2
             hit = nozzle + direction * (top - nozzle[2]) / direction[2]
-            load = self.water.blow(h, centre, hit, direction)
+            load = self.water.jet_load(centre, hit)
             want = np.clip(JET_LOAD_REF / max(load, 1e-6), *JET_SPEED_RANGE)
             self.gun_speed += (want - self.gun_speed) * min(h / JET_SPEED_TAU, 1.0)
-            self.jet.update(h, nozzle, hit)
-        elif self.blowing:
-            self.jet.hide()
+            self.air_idle = 0.0
+        else:
+            self.air_idle += h
+        self.step_air(h, np.asarray(centre, dtype=np.float64), nozzle, direction)
+        if self.blowing and not blow:
             alive = self.water.state != 3
             print(f"[tank] blowing done, {int(alive.sum())} beads left on the fixture, "
                   f"{int((alive & self.water.in_groove()).sum())} in the groove")
@@ -883,6 +1051,26 @@ class TankPick:
             self.gun_i += 1
             self.gun_t = 0.0
             print(f"[tank] phase {self.gun[self.gun_i][3]}")
+
+    def step_air(self, h, centre, nozzle, direction):
+        """Gas solver at PHYSICS_HZ / GAS_EVERY_N_STEPS while blowing and GAS_LINGER s after;
+        the beads feel the latest air field every physics step."""
+        if self.air_idle >= GAS_LINGER:
+            self.wind = None
+            return
+        self.air_steps += 1
+        if self.air_steps % GAS_EVERY_N_STEPS == 0:
+            dt = h * GAS_EVERY_N_STEPS
+            if self.air_solid_at is None or np.linalg.norm(centre - self.air_solid_at) > 0.25 * GAS_DX:
+                self.air.set_solid_box(centre, 0.5 * np.array(FIXTURE_SIZE))
+                self.air_solid_at = centre.copy()
+            self.air.set_nozzle(nozzle, direction, GAS_SPEED, GAS_NOZZLE_RADIUS)
+            self.air.step(dt)
+            if GAS_SHOW_TRACERS:
+                self.jet.update(dt, self.air, centre, nozzle, direction)
+            if self.water.started:
+                self.wind = self.air.sample(self.water.air_points(centre))[:, :2] * (GAS_REAL_SPEED / GAS_SPEED)
+        self.water.blow(h, centre, self.wind)
 
     def destroy(self):
         self._sub = None
